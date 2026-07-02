@@ -5,34 +5,46 @@ from playwright.async_api import async_playwright
 
 URL = "https://kadoobdc.co.tz/market-rates"
 
-# Exact branch names as they appear in the LIVE dropdown on /market-rates
-# (verified by hand by the site owner — this is the source of truth, not the
-# separate /branch content page, which uses different text for the same branches).
-DAR_ES_SALAAM_BRANCHES = [
-    "HEAD OFFICE",
-    "MASAKI BRANCH",
-    "KUNDUCHI BRANCH",
-    "IPS BUILDING BRANCH",
-    "MLIMANI CITY 2ND BRANCH",
-    "SAMORA BRANCH",
-    "SAMORA 2ND BRANCH",
-    "SINZA BRANCH",
-    "JAMHURI BRANCH",
-    "NAMANGA BRANCH",
-    "UHURU BRANCH",
-    "MOROCCO BRANCH",
-    "SIKUKUU BRANCH",
-    "MSIMBAZI BRANCH",
-    "MKUNGUNI BRANCH",
+# Dar es Salaam branches, matched by KEYWORD rather than exact dropdown text.
+# Exact-string matching turned out to be fragile — e.g. the real dropdown
+# entry for "Msimbazi" includes a hotel suffix ("MSIMBAZI CATE HOTEL BRANCH")
+# that wasn't in the original exact-match list, so that branch silently
+# dropped out of the results with no error. Keyword matching is robust to
+# that kind of wording variation. Each entry is:
+#   (display_label, [required substrings, ALL must be present],
+#                    [excluded substrings, NONE may be present])
+DAR_ES_SALAAM_BRANCH_MATCHERS = [
+    ("HEAD OFFICE",              ["HEAD OFFICE"], []),
+    ("MASAKI BRANCH",            ["MASAKI"], []),
+    ("KUNDUCHI BRANCH",          ["KUNDUCHI"], []),
+    ("IPS BUILDING BRANCH",      ["IPS"], []),
+    ("MLIMANI CITY 2ND BRANCH",  ["MLIMANI"], []),
+    ("SAMORA 2ND BRANCH",        ["SAMORA", "2ND"], []),
+    ("SAMORA BRANCH",            ["SAMORA"], ["2ND"]),
+    ("SINZA BRANCH",             ["SINZA"], []),
+    ("JAMHURI BRANCH",           ["JAMHURI"], []),
+    ("NAMANGA BRANCH",           ["NAMANGA"], []),
+    ("UHURU BRANCH",             ["UHURU"], []),
+    ("MOROCCO BRANCH",           ["MOROCCO"], []),
+    ("SIKUKUU BRANCH",           ["SIKUKUU"], []),
+    ("MSIMBAZI BRANCH",          ["MSIMBAZI"], []),
+    ("MKUNGUNI BRANCH",          ["MKUNGUNI"], []),
 ]
 
 
-def normalize(name: str) -> str:
-    """Loose match: uppercase, collapse whitespace, drop the word BRANCH."""
-    return " ".join(name.upper().replace("BRANCH", "").split())
+def match_dar_branch(option_text: str):
+    """Return the canonical display label for a dropdown option if it's a
+    Dar es Salaam branch, else None. Checked in the order defined above so
+    more specific rules (e.g. SAMORA 2ND) are tried before general ones."""
+    text_upper = option_text.upper()
+    for label, required, excluded in DAR_ES_SALAAM_BRANCH_MATCHERS:
+        if all(r in text_upper for r in required) and not any(e in text_upper for e in excluded):
+            return label
+    return None
 
 
-DAR_NORMALIZED = {normalize(b): b for b in DAR_ES_SALAAM_BRANCHES}
+# Preserves the intended display order regardless of dict insertion order.
+DAR_ES_SALAAM_BRANCHES = [label for label, _, _ in DAR_ES_SALAAM_BRANCH_MATCHERS]
 
 
 async def get_branch_options(page):
@@ -182,12 +194,14 @@ async def get_rates():
         prev_signature = await get_table_signature(page)
 
         for opt in options:
-            text_norm = normalize(opt["text"])
-            if text_norm not in DAR_NORMALIZED or not opt["value"]:
-                continue  # skip placeholder + non-Dar-es-Salaam branches
+            if not opt["value"]:
+                continue  # skip placeholder option
 
-            branch_label = DAR_NORMALIZED[text_norm]
-            print(f"Selecting branch: {opt['text']} (value={opt['value']})")
+            branch_label = match_dar_branch(opt["text"])
+            if branch_label is None:
+                continue  # not a Dar es Salaam branch
+
+            print(f"Selecting branch: {opt['text']} (value={opt['value']}) -> matched as {branch_label}")
 
             try:
                 await page.locator("select").first.select_option(value=opt["value"])
@@ -218,12 +232,15 @@ async def get_rates():
 def build_html(results: dict):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Determine highest USD buying rate among branches that actually returned a rate
+    # Determine highest USD buying rate among branches that actually returned a rate.
+    # Several branches can share the same top rate, so find the max value first,
+    # then list every branch that matches it — not just one.
     valid = {b: d for b, d in results.items() if d["usd_buy"] is not None}
-    best_branch, best_rate = (None, None)
-    if valid:
-        best_branch = max(valid, key=lambda b: valid[b]["usd_buy"])
-        best_rate = valid[best_branch]["usd_buy"]
+    best_rate = max((d["usd_buy"] for d in valid.values()), default=None)
+    best_branches = []
+    if best_rate is not None:
+        # Preserve the display order used elsewhere in the page.
+        best_branches = [b for b in DAR_ES_SALAAM_BRANCHES if b in valid and valid[b]["usd_buy"] == best_rate]
 
     html = [
         "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>",
@@ -231,6 +248,8 @@ def build_html(results: dict):
         "body{font-family:Arial,sans-serif;margin:16px;background:#f7f7f7;}",
         "h1{font-size:20px;} h2{font-size:16px;margin-top:28px;}",
         ".best{background:#fff3cd;padding:12px;border-radius:8px;border:1px solid #e0c46c;}",
+        ".disclaimer{background:#f4f4f4;padding:12px;border-radius:8px;border:1px solid #ccc;"
+        "font-size:13px;color:#444;margin-top:14px;}",
         "table{border-collapse:collapse;width:100%;margin-bottom:8px;background:#fff;}",
         "td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px;}",
         "th{background:#c0392b;color:#fff;}",
@@ -240,16 +259,28 @@ def build_html(results: dict):
         f"<div class='updated'>Last updated: {now}</div>",
     ]
 
-    if best_branch:
+    if best_branches:
+        if len(best_branches) == 1:
+            branch_text = f"<strong>{best_branches[0]}</strong>"
+        else:
+            branch_text = ", ".join(f"<strong>{b}</strong>" for b in best_branches)
         html.append(
             f"<div class='best'><strong>Highest USD Buying Rate:</strong> "
-            f"{valid[best_branch]['usd_buy']:.2f} TZS at <strong>{best_branch}</strong></div>"
+            f"{best_rate:.2f} TZS — available at: {branch_text}</div>"
         )
     else:
         html.append(
             "<div class='best'>Could not determine USD buying rate for any "
             "Dar es Salaam branch — see debug log in the Action run.</div>"
         )
+
+    html.append(
+        "<div class='disclaimer'><strong>Please note:</strong> the extraction of these "
+        "rates has been manually verified personally, but do not make any financial "
+        "decisions based on the information on this page. This is intended only as "
+        "guidance on the highest USD buying rate and which branch offers it. For any "
+        "financial decision, kindly call the bureau to confirm the current rates.</div>"
+    )
 
     if not results:
         html.append(
