@@ -1,1 +1,0 @@
-Kadoo rates
