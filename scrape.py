@@ -45,26 +45,46 @@ async def get_branch_options(page):
     return options
 
 
-async def scrape_branch_table(page):
+async def get_table_signature(page):
+    """A cheap fingerprint of the table's current content, used to detect
+    when the AJAX update for a newly-selected branch has actually landed."""
+    return await page.evaluate(
+        """() => {
+            const table = document.querySelector('table');
+            return table ? table.innerText : '';
+        }"""
+    )
+
+
+async def scrape_branch_table(page, previous_signature: str):
     """
     After a branch is selected, read the rates table.
     Expected columns on this site: Currency | Code | Buying | Selling
     Returns a list of dicts, and also the USD buying rate if found.
+
+    Critically, this waits for the table's content to actually CHANGE from
+    whatever it showed for the previously-selected branch, rather than just
+    checking "is there more than one row" — the old table already has rows
+    from the prior branch, so that check alone passes instantly and scrapes
+    stale data before the AJAX response for the new branch arrives.
     """
-    # Give the site's JS time to repopulate the table after the change event.
     try:
         await page.wait_for_function(
-            """() => {
+            """(prevSig) => {
                 const table = document.querySelector('table');
                 if (!table) return false;
                 const rows = table.querySelectorAll('tbody tr, tr');
-                return rows.length > 1; // more than just a header row
+                if (rows.length <= 1) return false; // only header, still loading
+                return table.innerText !== prevSig;
             }""",
-            timeout=8000,
+            arg=previous_signature,
+            timeout=10000,
         )
+        # Small settle delay in case the DOM updates in more than one paint.
+        await page.wait_for_timeout(300)
     except Exception:
-        # Some branches may load slower, or the table may briefly be empty
-        # while switching — don't hard-fail, just proceed and see what we get.
+        # If content never changed (e.g. two branches genuinely have identical
+        # rates), fall back to a fixed wait so we still capture *something*.
         await page.wait_for_timeout(1500)
 
     rows_data = await page.evaluate(
@@ -73,36 +93,61 @@ async def scrape_branch_table(page):
             if (!table) return [];
             const rows = Array.from(table.querySelectorAll('tr'));
             return rows.map(r =>
-                Array.from(r.querySelectorAll('td,th')).map(c => c.textContent.trim())
+                Array.from(r.querySelectorAll('td,th')).map(c => {
+                    const img = c.querySelector('img');
+                    return {
+                        text: c.textContent.trim(),
+                        alt: img ? (img.getAttribute('alt') || '').trim() : ''
+                    };
+                })
             );
         }"""
     )
 
     currencies = []
-    usd_buy = None
+    usd_candidates = []  # every USD-family row (US DOLLARS, $100 notes, $1, $5/$10/$20 notes, ...)
     for row in rows_data:
         if len(row) < 3:
             continue
-        # Skip header row (non-numeric buying/selling)
-        currency, code = row[0], row[1] if len(row) > 1 else ""
-        buying_raw = row[2] if len(row) > 2 else ""
-        selling_raw = row[3] if len(row) > 3 else ""
+
+        # Column layout on this site: [0] Currency = flag image, empty text
+        # (alt attribute may hold the name); [1] "Code" = actually the
+        # readable currency name text, not an ISO code; [2] Buying; [3] Selling.
+        cell0 = row[0] if len(row) > 0 else {"text": "", "alt": ""}
+        cell1 = row[1] if len(row) > 1 else {"text": "", "alt": ""}
+        buying_raw = row[2]["text"] if len(row) > 2 else ""
+        selling_raw = row[3]["text"] if len(row) > 3 else ""
 
         buying = parse_number(buying_raw)
         selling = parse_number(selling_raw)
         if buying is None and selling is None:
             continue  # header row or junk
 
+        # Prefer the Code column's text (the real name), fall back to the
+        # flag's alt text, then to the Currency cell's own text as a last resort.
+        name = cell1["text"] or cell0["alt"] or cell0["text"]
+
         currencies.append(
             {
-                "currency": currency,
-                "code": code.upper(),
+                "currency": name,
                 "buying": buying,
                 "selling": selling,
             }
         )
-        if code.upper() == "USD":
-            usd_buy = buying
+
+        name_upper = name.strip().upper()
+        if name_upper == "US DOLLARS" or name_upper.startswith("USD"):
+            usd_candidates.append({"currency": name_upper, "buying": buying})
+
+    # Several USD rows exist (main board rate + denomination-specific notes
+    # like "USD ($100 - 2006)", "USD ($1)", "USD ($5,$10,$20)"). The
+    # comparable board rate is the plain "US DOLLARS" row.
+    usd_buy = None
+    exact = [c for c in usd_candidates if c["currency"] == "US DOLLARS"]
+    if exact:
+        usd_buy = exact[0]["buying"]
+    elif usd_candidates:
+        usd_buy = usd_candidates[0]["buying"]
 
     return currencies, usd_buy
 
@@ -134,6 +179,8 @@ async def get_rates():
             print(f"  value={o['value']!r}  text={o['text']!r}")
         print("---------------------------------------")
 
+        prev_signature = await get_table_signature(page)
+
         for opt in options:
             text_norm = normalize(opt["text"])
             if text_norm not in DAR_NORMALIZED or not opt["value"]:
@@ -151,8 +198,12 @@ async def get_rates():
                 print(f"  Could not select {opt['text']}: {e}")
                 continue
 
-            currencies, usd_buy = await scrape_branch_table(page)
+            currencies, usd_buy = await scrape_branch_table(page, prev_signature)
             print(f"  -> {len(currencies)} currency rows, USD buy = {usd_buy}")
+
+            # This branch's table content becomes the baseline the next
+            # branch's update must differ from.
+            prev_signature = await get_table_signature(page)
 
             results[branch_label] = {
                 "currencies": currencies,
@@ -216,11 +267,11 @@ def build_html(results: dict):
             if not data["currencies"]:
                 html.append("<p>No rates returned for this branch.</p>")
                 continue
-            html.append("<table><tr><th>Currency</th><th>Code</th><th>Buying</th><th>Selling</th></tr>")
+            html.append("<table><tr><th>Currency</th><th>Buying</th><th>Selling</th></tr>")
             for c in data["currencies"]:
                 b = f"{c['buying']:.2f}" if c["buying"] is not None else "-"
                 s = f"{c['selling']:.2f}" if c["selling"] is not None else "-"
-                html.append(f"<tr><td>{c['currency']}</td><td>{c['code']}</td><td>{b}</td><td>{s}</td></tr>")
+                html.append(f"<tr><td>{c['currency']}</td><td>{b}</td><td>{s}</td></tr>")
             html.append("</table>")
 
     html.append("</body></html>")
