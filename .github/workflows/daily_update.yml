@@ -11,6 +11,8 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -25,6 +27,9 @@ jobs:
 
       - name: Run Scraper
         run: python scrape.py
+
+      - name: Debug File List
+        run: ls -la
 
       - name: Deploy
         run: |
