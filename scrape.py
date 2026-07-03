@@ -27,8 +27,9 @@ DAR_ES_SALAAM_BRANCH_MATCHERS = [
     ("UHURU BRANCH",             ["UHURU"], []),
     ("MOROCCO BRANCH",           ["MOROCCO"], []),
     ("SIKUKUU BRANCH",           ["SIKUKUU"], []),
-    ("MSIMBAZI BRANCH",          ["MSIMBAZI"], []),
+    ("MSIMBAZI CATE HOTEL BRANCH", ["MSIMBAZI"], []),
     ("MKUNGUNI BRANCH",          ["MKUNGUNI"], []),
+    ("DAR VILLAGE BRANCH",       ["DAR VILLAGE"], []),
 ]
 
 
@@ -96,8 +97,9 @@ async def scrape_branch_table(page, previous_signature: str):
         await page.wait_for_timeout(300)
     except Exception:
         # If content never changed (e.g. two branches genuinely have identical
-        # rates), fall back to a fixed wait so we still capture *something*.
-        await page.wait_for_timeout(1500)
+        # rates), fall back to a longer fixed wait so slow AJAX still lands
+        # before we read the table.
+        await page.wait_for_timeout(2500)
 
     rows_data = await page.evaluate(
         """() => {
@@ -175,8 +177,9 @@ def parse_number(raw: str):
 
 
 async def get_rates():
-    results = {}  # branch_name -> {"currencies": [...], "usd_buy": float|None}
+    results = {}  # branch_name -> {"currencies": [...], "usd_buy": float|None, "raw_options": [...]}
     debug_options = []
+    duplicate_warnings = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -219,18 +222,32 @@ async def get_rates():
             # branch's update must differ from.
             prev_signature = await get_table_signature(page)
 
-            results[branch_label] = {
-                "currencies": currencies,
-                "usd_buy": usd_buy,
-            }
+            if branch_label in results:
+                # Two different dropdown options both matched the same keyword.
+                # Rather than silently overwrite the earlier one (which is how
+                # the Msimbazi rate mismatch happened), keep BOTH under
+                # distinct keys so nothing is lost and the duplicate is visible
+                # on the page itself.
+                dup_key = f"{branch_label} [dropdown text: {opt['text']}]"
+                msg = (
+                    f"DUPLICATE MATCH: '{opt['text']}' also matched '{branch_label}', "
+                    f"which was already filled by a different dropdown option. "
+                    f"Keeping both — see '{dup_key}' on the page."
+                )
+                print(f"  WARNING: {msg}")
+                duplicate_warnings.append(msg)
+                results[dup_key] = {"currencies": currencies, "usd_buy": usd_buy}
+            else:
+                results[branch_label] = {"currencies": currencies, "usd_buy": usd_buy}
 
         await browser.close()
 
-    return results, debug_options
+    return results, debug_options, duplicate_warnings
 
 
-def build_html(results: dict):
+def build_html(results: dict, duplicate_warnings=None):
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    duplicate_warnings = duplicate_warnings or []
 
     # Determine highest USD buying rate among branches that actually returned a rate.
     # Several branches can share the same top rate, so find the max value first,
@@ -239,8 +256,11 @@ def build_html(results: dict):
     best_rate = max((d["usd_buy"] for d in valid.values()), default=None)
     best_branches = []
     if best_rate is not None:
-        # Preserve the display order used elsewhere in the page.
-        best_branches = [b for b in DAR_ES_SALAAM_BRANCHES if b in valid and valid[b]["usd_buy"] == best_rate]
+        # Preserve the display order used elsewhere in the page where possible;
+        # any duplicate-suffixed keys just sort alphabetically at the end.
+        ordered = [b for b in DAR_ES_SALAAM_BRANCHES if b in valid]
+        ordered += [b for b in valid if b not in DAR_ES_SALAAM_BRANCHES]
+        best_branches = [b for b in ordered if valid[b]["usd_buy"] == best_rate]
 
     html = [
         "<html><head><meta name='viewport' content='width=device-width, initial-scale=1'>",
@@ -250,6 +270,8 @@ def build_html(results: dict):
         ".best{background:#fff3cd;padding:12px;border-radius:8px;border:1px solid #e0c46c;}",
         ".disclaimer{background:#f4f4f4;padding:12px;border-radius:8px;border:1px solid #ccc;"
         "font-size:13px;color:#444;margin-top:14px;}",
+        ".warning{background:#f8d7da;padding:12px;border-radius:8px;border:1px solid #f1aeb5;"
+        "font-size:13px;color:#58151c;margin-top:14px;}",
         "table{border-collapse:collapse;width:100%;margin-bottom:8px;background:#fff;}",
         "td,th{border:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px;}",
         "th{background:#c0392b;color:#fff;}",
@@ -282,6 +304,15 @@ def build_html(results: dict):
         "financial decision, kindly call the bureau to confirm the current rates.</div>"
     )
 
+    if duplicate_warnings:
+        html.append("<div class='warning'><strong>Data check needed:</strong> more than one dropdown "
+                     "entry on Kadoo's site matched the same branch name below — both are shown "
+                     "separately so no data was silently dropped. Please verify manually which is "
+                     "current:<ul>")
+        for w in duplicate_warnings:
+            html.append(f"<li>{w}</li>")
+        html.append("</ul></div>")
+
     if not results:
         html.append(
             "<h2>Rates are currently unavailable.</h2>"
@@ -290,9 +321,9 @@ def build_html(results: dict):
             "the branch names may not match DAR_ES_SALAAM_BRANCHES exactly.</p>"
         )
     else:
-        for branch in DAR_ES_SALAAM_BRANCHES:
-            if branch not in results:
-                continue
+        ordered = [b for b in DAR_ES_SALAAM_BRANCHES if b in results]
+        ordered += [b for b in results if b not in DAR_ES_SALAAM_BRANCHES]
+        for branch in ordered:
             data = results[branch]
             html.append(f"<h2>{branch}</h2>")
             if not data["currencies"]:
@@ -310,17 +341,19 @@ def build_html(results: dict):
 
 
 async def main():
-    results, debug_options = await get_rates()
+    results, debug_options, duplicate_warnings = await get_rates()
 
     # Save raw debug data so a failed run is easy to diagnose from Action logs/artifacts
     with open("debug_options.json", "w") as f:
         json.dump(debug_options, f, indent=2)
 
-    html = build_html(results)
+    html = build_html(results, duplicate_warnings)
     with open("index.html", "w") as f:
         f.write(html)
 
     print(f"Done. Captured {len(results)} Dar es Salaam branches.")
+    if duplicate_warnings:
+        print(f"NOTE: {len(duplicate_warnings)} duplicate branch match(es) — see index.html for details.")
 
 
 if __name__ == "__main__":
