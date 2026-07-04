@@ -2,10 +2,11 @@ name: Auto-Update Rates
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 5 * * *"
+    - cron: "5 6 * * *"
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
@@ -43,3 +44,50 @@ jobs:
           git add index.html
           git commit -m "Auto-update rates $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
           git push
+
+      - name: Auto-retry GitHub Pages deployment if it fails
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Waiting for GitHub's Pages deployment workflow to start..."
+          sleep 20
+
+          MAX_ATTEMPTS=5
+          attempt=1
+
+          while [ $attempt -le $MAX_ATTEMPTS ]; do
+            echo "Attempt $attempt: checking latest pages-build-deployment run..."
+
+            RUN_JSON=$(gh run list --workflow="pages-build-deployment" --limit 1 --json databaseId,status,conclusion)
+            RUN_ID=$(echo "$RUN_JSON" | jq -r '.[0].databaseId // empty')
+            STATUS=$(echo "$RUN_JSON" | jq -r '.[0].status // empty')
+            CONCLUSION=$(echo "$RUN_JSON" | jq -r '.[0].conclusion // empty')
+
+            if [ -z "$RUN_ID" ]; then
+              echo "No pages-build-deployment run found yet, waiting..."
+              sleep 15
+              attempt=$((attempt + 1))
+              continue
+            fi
+
+            echo "Run ID: $RUN_ID | Status: $STATUS | Conclusion: $CONCLUSION"
+
+            if [ "$STATUS" != "completed" ]; then
+              echo "Still running, waiting..."
+              sleep 15
+              continue
+            fi
+
+            if [ "$CONCLUSION" == "success" ]; then
+              echo "Pages deployment succeeded. Done."
+              exit 0
+            fi
+
+            echo "Pages deployment failed (conclusion: $CONCLUSION). Re-running it..."
+            gh run rerun "$RUN_ID"
+            sleep 20
+            attempt=$((attempt + 1))
+          done
+
+          echo "Gave up after $MAX_ATTEMPTS attempts. Check the Actions tab manually."
+          exit 0
