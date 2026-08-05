@@ -50,9 +50,23 @@ DAR_ES_SALAAM_BRANCHES = [label for label, _, _ in DAR_ES_SALAAM_BRANCH_MATCHERS
 
 
 async def get_branch_options(page):
-    """Return [{value, text}] for every <option> in the branch <select>."""
+    """Return [{value, text}] for every <option> in the branch <select>.
+
+    Waiting for the <select> to be "attached" isn't enough — on this site the
+    dropdown element exists in the page immediately, but the real branch list
+    is populated into it slightly later via JS. So we wait for it to actually
+    have more than just the placeholder option before reading it.
+    """
     select = page.locator("select").first
     await select.wait_for(state="attached", timeout=30000)
+    await page.wait_for_function(
+        """(sel) => {
+            const el = document.querySelector(sel);
+            return el && el.options && el.options.length > 1;
+        }""",
+        arg="select",
+        timeout=20000,
+    )
     options = await select.evaluate(
         """(el) => Array.from(el.options).map(o => ({value: o.value, text: o.textContent.trim()}))"""
     )
