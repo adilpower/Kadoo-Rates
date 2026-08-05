@@ -30,6 +30,7 @@ DAR_ES_SALAAM_BRANCH_MATCHERS = [
     ("MSIMBAZI CATE HOTEL BRANCH", ["MSIMBAZI"], []),
     ("MKUNGUNI BRANCH",          ["MKUNGUNI"], []),
     ("DAR VILLAGE BRANCH",       ["DAR VILLAGE"], []),
+    ("UBUNGO BRANCH",            ["UBUNGO"], []),
 ]
 
 
@@ -51,11 +52,37 @@ DAR_ES_SALAAM_BRANCHES = [label for label, _, _ in DAR_ES_SALAAM_BRANCH_MATCHERS
 async def get_branch_options(page):
     """Return [{value, text}] for every <option> in the branch <select>."""
     select = page.locator("select").first
-    await select.wait_for(state="attached", timeout=15000)
+    await select.wait_for(state="attached", timeout=30000)
     options = await select.evaluate(
         """(el) => Array.from(el.options).map(o => ({value: o.value, text: o.textContent.trim()}))"""
     )
     return options
+
+
+async def load_page_with_retry(page, url, attempts=3):
+    """
+    Navigate to the page and wait for the branch dropdown to appear, retrying
+    on failure. Kadoo's server is sometimes slow to respond (intermittent,
+    not a permanent site change), so a single timeout shouldn't be treated
+    as fatal — a fresh reload often succeeds where the first attempt didn't.
+    """
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            print(f"Loading page (attempt {attempt}/{attempts})...")
+            # domcontentloaded instead of networkidle: networkidle waits for
+            # ALL network activity to stop, which can hang indefinitely if
+            # the page has any background polling — domcontentloaded plus
+            # our own explicit wait for the dropdown is more reliable.
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await get_branch_options(page)  # just to confirm it's ready; re-fetched by caller
+            return
+        except Exception as e:
+            last_error = e
+            print(f"  Attempt {attempt} failed: {e}")
+            if attempt < attempts:
+                await page.wait_for_timeout(3000)
+    raise last_error
 
 
 async def get_table_signature(page):
@@ -185,7 +212,7 @@ async def get_rates():
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
 
-        await page.goto(URL, wait_until="networkidle")
+        await load_page_with_retry(page, URL, attempts=3)
 
         options = await get_branch_options(page)
         debug_options = options
